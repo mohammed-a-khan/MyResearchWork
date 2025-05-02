@@ -1,0 +1,952 @@
+/**
+ * Executes a SQL query with parameters and stores the result for comparison.
+ * Parameters are provided as comma-separated values that will replace placeholders in the query.
+ * 
+ * @param query the SQL query with ? placeholders for parameters
+ * @param parameters comma-separated parameters to inject into the query
+ * @param resultVariable name of the variable to store the query result
+ */
+@QAFTestStep(description = "I execute SQL query {query} with parameters {parameters} and store result in {resultVariable}")
+public void executeSqlQueryWithParametersAndStore(String query, String parameters, String resultVariable) {
+    logger.info("Executing SQL query with parameters and storing result in variable: " + resultVariable);
+    
+    try {
+        // Parse the parameters
+        String[] paramValues = parameters.split("\\s*,\\s*");
+        Object[] queryParams = new Object[paramValues.length];
+        
+        // Process each parameter
+        for (int i = 0; i < paramValues.length; i++) {
+            String param = paramValues[i].trim();
+            
+            // Check if the parameter is a reference to test data
+            if (param.startsWith("${") && param.endsWith("}")) {
+                String dataKey = param.substring(2, param.length() - 1);
+                queryParams[i] = TestContextManager.getTestDataValue(dataKey);
+                logger.info("Parameter " + (i+1) + " resolved from test data: " + dataKey + " = " + queryParams[i]);
+            } else {
+                // Direct value
+                queryParams[i] = param;
+                logger.info("Parameter " + (i+1) + " direct value: " + param);
+            }
+        }
+        
+        // Execute the query with parameters
+        List<Map<String, Object>> queryResults = executeSqlQueryWithParams(query, queryParams);
+        logger.info("Query executed successfully. Result size: " + queryResults.size());
+        
+        // Store the result in test context
+        TestContextManager.setContext(resultVariable, queryResults);
+        Reporter.log("SQL query executed with parameters and result stored in variable: " + resultVariable);
+        
+    } catch (Exception e) {
+        logger.error("Error executing SQL query with parameters: " + e.getMessage(), e);
+        Reporter.log("Error executing SQL query with parameters: " + e.getMessage());
+        throw new RuntimeException("Failed to execute SQL query with parameters: " + e.getMessage(), e);
+    }
+}
+
+/**
+ * Helper method to execute a prepared statement with parameters.
+ * 
+ * @param query the SQL query with ? placeholders
+ * @param params the parameters to inject into the query
+ * @return list of result maps
+ * @throws Exception if there's an error executing the query
+ */
+private List<Map<String, Object>> executeSqlQueryWithParams(String query, Object[] params) throws Exception {
+    List<Map<String, Object>> results = new ArrayList<>();
+    
+    String dbUrl = ConfigurationManager.getBundle().getString("db.url");
+    String dbUser = ConfigurationManager.getBundle().getString("db.user");
+    String dbPassword = ConfigurationManager.getBundle().getString("db.password");
+    
+    try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+         PreparedStatement stmt = conn.prepareStatement(query)) {
+        
+        // Set parameters
+        for (int i = 0; i < params.length; i++) {
+            stmt.setObject(i + 1, params[i]);
+        }
+        
+        // Execute and process results
+        try (ResultSet rs = stmt.executeQuery()) {
+            ResultSetMetaData metaData = rs.getMetaData();
+            int columnCount = metaData.getColumnCount();
+            
+            while (rs.next()) {
+                Map<String, Object> row = new HashMap<>();
+                
+                for (int i = 1; i <= columnCount; i++) {
+                    String columnName = metaData.getColumnName(i);
+                    Object value = rs.getObject(i);
+                    row.put(columnName, value);
+                }
+                
+                results.add(row);
+            }
+        }
+    }
+    
+    return results;
+}
+
+
+/**
+ * Compares the query results stored in a variable with DeptDetails in the response.
+ * 
+ * @param resultVariable the variable containing the query results
+ * @param responseJsonPath the JSON path to the DeptDetails array (e.g., "employees[0].DeptDetails")
+ */
+@QAFTestStep(description = "I verify {resultVariable} query results match {responseJsonPath} in response")
+public void verifyQueryResultsMatchResponseData(String resultVariable, String responseJsonPath) {
+    logger.info("Verifying query results in " + resultVariable + " against response path: " + responseJsonPath);
+    
+    ApiResponse response = getResponse();
+    if (response == null) {
+        fail("No response available. Make sure to send a request first.");
+        return;
+    }
+    
+    try {
+        // Get the query results from context
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> queryResults = 
+            (List<Map<String, Object>>) TestContextManager.getContext(resultVariable);
+        
+        if (queryResults == null || queryResults.isEmpty()) {
+            Reporter.log("Query results not found or empty in variable: " + resultVariable);
+            fail("Query results not found or empty in variable: " + resultVariable);
+            return;
+        }
+        
+        // Extract the target data from response using JSONPath
+        JSONObject jsonResponse = response.getJsonObject();
+        Object targetData = getValueFromJsonPath(jsonResponse, responseJsonPath);
+        
+        if (targetData == null) {
+            Reporter.log("Data not found in response at path: " + responseJsonPath);
+            fail("Data not found in response at path: " + responseJsonPath);
+            return;
+        }
+        
+        // Convert target data to a list of maps
+        List<Map<String, Object>> responseDataList = convertJsonArrayToList(targetData);
+        
+        // Verify the data matches
+        boolean matches = compareDataSets(queryResults, responseDataList);
+        
+        if (matches) {
+            Reporter.log("✓ Query results match response data at path: " + responseJsonPath);
+        } else {
+            Reporter.log("✗ Query results DO NOT match response data at path: " + responseJsonPath);
+            fail("Query results DO NOT match response data at path: " + responseJsonPath);
+        }
+        
+    } catch (Exception e) {
+        logger.error("Error comparing query results with response data: " + e.getMessage(), e);
+        Reporter.log("Error comparing query results with response data: " + e.getMessage());
+        fail("Error comparing query results with response data: " + e.getMessage());
+    }
+}
+
+/**
+ * Extracts a value from a JSON object using JSONPath-like syntax.
+ * 
+ * @param json the JSON object
+ * @param path the path to the value (e.g., "employees[0].DeptDetails")
+ * @return the value at the specified path
+ */
+private Object getValueFromJsonPath(JSONObject json, String path) {
+    String[] parts = path.split("\\.");
+    Object current = json;
+    
+    for (String part : parts) {
+        // Handle array indexing
+        if (part.contains("[") && part.endsWith("]")) {
+            String arrayName = part.substring(0, part.indexOf('['));
+            int index = Integer.parseInt(part.substring(part.indexOf('[') + 1, part.length() - 1));
+            
+            if (current instanceof JSONObject) {
+                JSONObject currentObj = (JSONObject) current;
+                if (currentObj.has(arrayName)) {
+                    JSONArray array = currentObj.getJSONArray(arrayName);
+                    if (index < array.length()) {
+                        current = array.get(index);
+                    } else {
+                        return null;
+                    }
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        } else {
+            // Simple property access
+            if (current instanceof JSONObject) {
+                JSONObject currentObj = (JSONObject) current;
+                if (currentObj.has(part)) {
+                    current = currentObj.get(part);
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+    }
+    
+    return current;
+}
+
+/**
+ * Converts a JSON array to a List of Maps for comparison.
+ * 
+ * @param data the JSON array or object to convert
+ * @return list of maps representing the data
+ */
+private List<Map<String, Object>> convertJsonArrayToList(Object data) {
+    List<Map<String, Object>> result = new ArrayList<>();
+    
+    if (data instanceof JSONArray) {
+        JSONArray array = (JSONArray) data;
+        for (int i = 0; i < array.length(); i++) {
+            Object item = array.get(i);
+            if (item instanceof JSONObject) {
+                Map<String, Object> map = jsonObjectToMap((JSONObject) item);
+                result.add(map);
+            }
+        }
+    } else if (data instanceof JSONObject) {
+        Map<String, Object> map = jsonObjectToMap((JSONObject) data);
+        result.add(map);
+    }
+    
+    return result;
+}
+
+/**
+ * Converts a JSONObject to a Map.
+ * 
+ * @param json the JSONObject to convert
+ * @return map representing the JSONObject
+ */
+private Map<String, Object> jsonObjectToMap(JSONObject json) {
+    Map<String, Object> map = new HashMap<>();
+    
+    for (String key : json.keySet()) {
+        Object value = json.get(key);
+        
+        // Handle JSONObject and JSONArray
+        if (value instanceof JSONObject) {
+            map.put(key, jsonObjectToMap((JSONObject) value));
+        } else if (value instanceof JSONArray) {
+            map.put(key, jsonArrayToList((JSONArray) value));
+        } else {
+            map.put(key, value);
+        }
+    }
+    
+    return map;
+}
+
+/**
+ * Converts a JSONArray to a List.
+ * 
+ * @param array the JSONArray to convert
+ * @return list representing the JSONArray
+ */
+private List<Object> jsonArrayToList(JSONArray array) {
+    List<Object> list = new ArrayList<>();
+    
+    for (int i = 0; i < array.length(); i++) {
+        Object value = array.get(i);
+        
+        if (value instanceof JSONObject) {
+            list.add(jsonObjectToMap((JSONObject) value));
+        } else if (value instanceof JSONArray) {
+            list.add(jsonArrayToList((JSONArray) value));
+        } else {
+            list.add(value);
+        }
+    }
+    
+    return list;
+}
+
+/**
+ * Compares two datasets for equality.
+ * 
+ * @param queryResults the query results
+ * @param responseData the response data
+ * @return true if the datasets match
+ */
+private boolean compareDataSets(List<Map<String, Object>> queryResults, List<Map<String, Object>> responseData) {
+    if (queryResults.size() != responseData.size()) {
+        logger.info("Data size mismatch: Query results have " + queryResults.size() + 
+                    " records, response has " + responseData.size() + " records");
+        return false;
+    }
+    
+    // Map to track matched records
+    Map<Integer, Integer> matchedPairs = new HashMap<>();
+    
+    // For each query result, find a matching response data record
+    for (int i = 0; i < queryResults.size(); i++) {
+        Map<String, Object> queryRecord = queryResults.get(i);
+        boolean foundMatch = false;
+        
+        for (int j = 0; j < responseData.size(); j++) {
+            // Skip if this response record is already matched
+            if (matchedPairs.containsValue(j)) {
+                continue;
+            }
+            
+            Map<String, Object> responseRecord = responseData.get(j);
+            if (recordsMatch(queryRecord, responseRecord)) {
+                matchedPairs.put(i, j);
+                foundMatch = true;
+                break;
+            }
+        }
+        
+        if (!foundMatch) {
+            logger.info("No match found for query result record #" + (i+1));
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+/**
+ * Checks if two records match by comparing their fields.
+ * 
+ * @param queryRecord the query record
+ * @param responseRecord the response record
+ * @return true if the records match
+ */
+private boolean recordsMatch(Map<String, Object> queryRecord, Map<String, Object> responseRecord) {
+    // Check that all query record fields are present in response record with matching values
+    for (Map.Entry<String, Object> entry : queryRecord.entrySet()) {
+        String fieldName = entry.getKey();
+        Object queryValue = entry.getValue();
+        
+        // Try to find a matching field in the response (case insensitive)
+        String matchingField = findMatchingFieldName(fieldName, responseRecord.keySet());
+        if (matchingField == null) {
+            logger.debug("Field '" + fieldName + "' not found in response record");
+            return false;
+        }
+        
+        Object responseValue = responseRecord.get(matchingField);
+        
+        // Handle nulls
+        if (queryValue == null && responseValue == null) {
+            continue;
+        }
+        if (queryValue == null || responseValue == null) {
+            logger.debug("Null value mismatch for field '" + fieldName + "'");
+            return false;
+        }
+        
+        // Handle numeric types
+        if (queryValue instanceof Number && responseValue instanceof Number) {
+            double queryDouble = ((Number) queryValue).doubleValue();
+            double responseDouble = ((Number) responseValue).doubleValue();
+            
+            // Use a small epsilon for floating point comparison
+            if (Math.abs(queryDouble - responseDouble) > 0.0001) {
+                logger.debug("Numeric value mismatch for field '" + fieldName + "': " + 
+                             queryValue + " vs " + responseValue);
+                return false;
+            }
+        } 
+        // Handle string types
+        else if (queryValue instanceof String && responseValue instanceof String) {
+            if (!queryValue.toString().equalsIgnoreCase(responseValue.toString())) {
+                logger.debug("String value mismatch for field '" + fieldName + "': " + 
+                             queryValue + " vs " + responseValue);
+                return false;
+            }
+        }
+        // Handle other types
+        else if (!queryValue.toString().equals(responseValue.toString())) {
+            logger.debug("Value mismatch for field '" + fieldName + "': " + 
+                         queryValue + " vs " + responseValue);
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+/**
+ * Finds a matching field name in the target set, case insensitive.
+ * 
+ * @param fieldName the field name to find
+ * @param targetFields the set of target field names
+ * @return the matching field name, or null if not found
+ */
+private String findMatchingFieldName(String fieldName, Set<String> targetFields) {
+    // First try exact match
+    if (targetFields.contains(fieldName)) {
+        return fieldName;
+    }
+    
+    // Then try case-insensitive match
+    String lowerFieldName = fieldName.toLowerCase();
+    for (String targetField : targetFields) {
+        if (targetField.toLowerCase().equals(lowerFieldName)) {
+            return targetField;
+        }
+    }
+    
+    return null;
+}
+
+
+
+/**
+ * Validates a response field against database query results using a flexible mapping approach.
+ * Supports nested JSON paths and complex data structures.
+ * 
+ * @param responsePath JSON path to the field in the response (supports dot notation and array indexing)
+ * @param queryResultVar variable name containing the database query results
+ * @param mappingConfig configuration for mapping DB columns to response fields (optional)
+ */
+@QAFTestStep(description = "I validate response path {responsePath} against query results {queryResultVar} with mapping {mappingConfig}")
+public void validateResponsePathAgainstQueryResults(String responsePath, String queryResultVar, String mappingConfig) {
+    logger.info("Validating response path '" + responsePath + "' against query results in variable '" + queryResultVar + "'");
+    
+    ApiResponse response = getResponse();
+    if (response == null) {
+        fail("No response available. Make sure to send a request first.");
+        return;
+    }
+    
+    JSONObject jsonResponse = response.getJsonObject();
+    if (jsonResponse == null) {
+        fail("Invalid JSON response");
+        return;
+    }
+    
+    try {
+        // Get the query results from context
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> queryResults = 
+            (List<Map<String, Object>>) TestContextManager.getContext(queryResultVar);
+        
+        if (queryResults == null || queryResults.isEmpty()) {
+            Reporter.log("Query results not found or empty in variable: " + queryResultVar);
+            fail("Query results not found or empty in variable: " + queryResultVar);
+            return;
+        }
+        
+        // Parse the mapping configuration
+        Map<String, String> fieldMappings = parseFieldMappings(mappingConfig);
+        
+        // Extract the data from the response at the specified path
+        Object responseData = extractFromJsonPath(jsonResponse, responsePath);
+        if (responseData == null) {
+            Reporter.log("Data not found in response at path: " + responsePath);
+            fail("Data not found in response at path: " + responsePath);
+            return;
+        }
+        
+        // Convert response data to a structure we can compare with DB results
+        List<Map<String, Object>> responseDataList = normalizeResponseData(responseData);
+        
+        // Perform deep comparison with mapping
+        ComparisonResult result = compareDataWithMapping(queryResults, responseDataList, fieldMappings);
+        
+        if (result.success) {
+            Reporter.log("✓ Response data at path '" + responsePath + "' matches query results");
+            for (String message : result.matchDetails) {
+                Reporter.log("  - " + message);
+            }
+        } else {
+            Reporter.log("✗ Response data at path '" + responsePath + "' does not match query results");
+            for (String error : result.errors) {
+                Reporter.log("  - " + error);
+            }
+            fail("Response data does not match query results: " + result.errors.get(0));
+        }
+        
+    } catch (Exception e) {
+        logger.error("Error validating response against query results: " + e.getMessage(), e);
+        Reporter.log("Error validating response against query results: " + e.getMessage());
+        fail("Error validating response against query results: " + e.getMessage());
+    }
+}
+
+/**
+ * Result class for data comparisons.
+ */
+private static class ComparisonResult {
+    boolean success;
+    List<String> errors = new ArrayList<>();
+    List<String> matchDetails = new ArrayList<>();
+}
+
+/**
+ * Parses the field mapping configuration string into a map.
+ * Format: "dbColumn1:responsePath1,dbColumn2:responsePath2,..."
+ * 
+ * @param mappingConfig the mapping configuration string
+ * @return map of database column names to response field paths
+ */
+private Map<String, String> parseFieldMappings(String mappingConfig) {
+    Map<String, String> mappings = new HashMap<>();
+    
+    if (mappingConfig == null || mappingConfig.trim().isEmpty()) {
+        return mappings; // Return empty map for default mapping
+    }
+    
+    String[] mappingPairs = mappingConfig.split("\\s*,\\s*");
+    for (String pair : mappingPairs) {
+        String[] parts = pair.split("\\s*:\\s*");
+        if (parts.length == 2) {
+            mappings.put(parts[0].trim(), parts[1].trim());
+        }
+    }
+    
+    return mappings;
+}
+
+/**
+ * Extracts data from a JSON object using a path expression.
+ * Supports dot notation and array indexing (e.g., "empInfo[0].empDetails[*].deptId").
+ * Special handling for [*] to get all array elements.
+ * 
+ * @param json the JSON object to extract from
+ * @param path the path to extract
+ * @return the extracted data
+ */
+private Object extractFromJsonPath(JSONObject json, String path) {
+    if (path == null || path.isEmpty()) {
+        return json;
+    }
+    
+    String[] segments = path.split("\\.");
+    Object current = json;
+    
+    for (String segment : segments) {
+        if (current == null) {
+            return null;
+        }
+        
+        // Handle array access
+        if (segment.contains("[") && segment.endsWith("]")) {
+            String fieldName = segment.substring(0, segment.indexOf('['));
+            String indexStr = segment.substring(segment.indexOf('[') + 1, segment.length() - 1);
+            
+            // Get the array field first
+            if (current instanceof JSONObject) {
+                JSONObject jsonObj = (JSONObject) current;
+                if (!jsonObj.has(fieldName)) {
+                    return null;
+                }
+                current = jsonObj.get(fieldName);
+            } else {
+                return null;
+            }
+            
+            // Then handle array indexing
+            if (current instanceof JSONArray) {
+                JSONArray array = (JSONArray) current;
+                
+                // Handle wildcard [*] to get all array items
+                if (indexStr.equals("*")) {
+                    return array;
+                }
+                
+                // Handle numeric index
+                try {
+                    int index = Integer.parseInt(indexStr);
+                    if (index >= 0 && index < array.length()) {
+                        current = array.get(index);
+                    } else {
+                        return null;
+                    }
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        } 
+        // Simple field access
+        else if (current instanceof JSONObject) {
+            JSONObject jsonObj = (JSONObject) current;
+            if (!jsonObj.has(segment)) {
+                return null;
+            }
+            current = jsonObj.get(segment);
+        } else {
+            return null;
+        }
+    }
+    
+    return current;
+}
+
+/**
+ * Normalizes response data into a consistent format for comparison.
+ * Handles various data structures: single object, array, nested arrays, etc.
+ * 
+ * @param data the response data to normalize
+ * @return normalized list of maps for comparison
+ */
+private List<Map<String, Object>> normalizeResponseData(Object data) {
+    List<Map<String, Object>> result = new ArrayList<>();
+    
+    if (data instanceof JSONArray) {
+        JSONArray array = (JSONArray) data;
+        for (int i = 0; i < array.length(); i++) {
+            Object item = array.get(i);
+            if (item instanceof JSONObject) {
+                result.add(flattenJsonObject((JSONObject) item, null));
+            } else if (item instanceof JSONArray) {
+                result.addAll(normalizeResponseData(item));
+            }
+        }
+    } else if (data instanceof JSONObject) {
+        result.add(flattenJsonObject((JSONObject) data, null));
+    }
+    
+    return result;
+}
+
+/**
+ * Flattens a nested JSON object into a single map with dot notation for nested paths.
+ * Makes complex nested structures comparable with flat DB results.
+ * 
+ * @param json the JSON object to flatten
+ * @param prefix the prefix for keys (used in recursion)
+ * @return flattened map of the JSON object
+ */
+private Map<String, Object> flattenJsonObject(JSONObject json, String prefix) {
+    Map<String, Object> result = new HashMap<>();
+    
+    for (String key : json.keySet()) {
+        Object value = json.get(key);
+        String fullKey = prefix != null ? prefix + "." + key : key;
+        
+        if (value instanceof JSONObject) {
+            result.putAll(flattenJsonObject((JSONObject) value, fullKey));
+        } else if (value instanceof JSONArray) {
+            JSONArray array = (JSONArray) value;
+            
+            // Add the array itself with the current key
+            result.put(fullKey, array);
+            
+            // Also add flattened representation of array items
+            for (int i = 0; i < array.length(); i++) {
+                Object item = array.get(i);
+                if (item instanceof JSONObject) {
+                    result.putAll(flattenJsonObject((JSONObject) item, fullKey + "[" + i + "]"));
+                }
+            }
+        } else {
+            result.put(fullKey, value);
+        }
+    }
+    
+    return result;
+}
+
+/**
+ * Compares database query results with response data using provided field mappings.
+ * 
+ * @param queryResults the query results from the database
+ * @param responseData the normalized response data
+ * @param fieldMappings the mappings from DB columns to response fields
+ * @return comparison result with success flag and details
+ */
+private ComparisonResult compareDataWithMapping(
+        List<Map<String, Object>> queryResults, 
+        List<Map<String, Object>> responseData,
+        Map<String, String> fieldMappings) {
+    
+    ComparisonResult result = new ComparisonResult();
+    
+    // If no mapping provided, try to match fields by name (case-insensitive)
+    if (fieldMappings.isEmpty()) {
+        // Generate mappings automatically based on field names
+        fieldMappings = generateAutomaticMappings(queryResults, responseData);
+        result.matchDetails.add("Using auto-generated field mappings: " + fieldMappings);
+    }
+    
+    // No mappings could be found
+    if (fieldMappings.isEmpty()) {
+        result.success = false;
+        result.errors.add("No field mappings available. Cannot compare data.");
+        return result;
+    }
+    
+    // Keep track of matched DB records
+    Set<Integer> matchedDbRecords = new HashSet<>();
+    
+    // For each response record, find a matching DB record
+    for (int i = 0; i < responseData.size(); i++) {
+        Map<String, Object> responseRecord = responseData.get(i);
+        boolean foundMatch = false;
+        
+        // Record identifier for logs
+        String respRecordId = "Response record #" + (i+1);
+        if (responseRecord.containsKey("empId")) {
+            respRecordId += " (empId: " + responseRecord.get("empId") + ")";
+        }
+        
+        // Try to match with each DB record
+        for (int j = 0; j < queryResults.size(); j++) {
+            // Skip already matched DB records
+            if (matchedDbRecords.contains(j)) {
+                continue;
+            }
+            
+            Map<String, Object> dbRecord = queryResults.get(j);
+            boolean recordMatches = true;
+            List<String> fieldMismatches = new ArrayList<>();
+            
+            // DB record identifier for logs
+            String dbRecordId = "DB record #" + (j+1);
+            if (dbRecord.containsKey("emp_id")) {
+                dbRecordId += " (emp_id: " + dbRecord.get("emp_id") + ")";
+            }
+            
+            // Check each mapped field
+            for (Map.Entry<String, String> mapping : fieldMappings.entrySet()) {
+                String dbColumn = mapping.getKey();
+                String responsePath = mapping.getValue();
+                
+                if (!dbRecord.containsKey(dbColumn)) {
+                    fieldMismatches.add("DB column '" + dbColumn + "' not found in DB record");
+                    recordMatches = false;
+                    continue;
+                }
+                
+                if (!responseRecord.containsKey(responsePath)) {
+                    fieldMismatches.add("Response field '" + responsePath + "' not found in response record");
+                    recordMatches = false;
+                    continue;
+                }
+                
+                Object dbValue = dbRecord.get(dbColumn);
+                Object responseValue = responseRecord.get(responsePath);
+                
+                if (!valuesAreEqual(dbValue, responseValue)) {
+                    fieldMismatches.add("Value mismatch for mapping '" + dbColumn + "' -> '" + responsePath + 
+                                       "': DB='" + dbValue + "', Response='" + responseValue + "'");
+                    recordMatches = false;
+                }
+            }
+            
+            if (recordMatches) {
+                matchedDbRecords.add(j);
+                foundMatch = true;
+                result.matchDetails.add(respRecordId + " matches with " + dbRecordId);
+                break;
+            } else if (logger.isDebugEnabled()) {
+                // Log mismatches at debug level
+                logger.debug(respRecordId + " does not match " + dbRecordId + ":");
+                for (String mismatch : fieldMismatches) {
+                    logger.debug("  - " + mismatch);
+                }
+            }
+        }
+        
+        if (!foundMatch) {
+            result.success = false;
+            result.errors.add(respRecordId + " has no matching DB record");
+        }
+    }
+    
+    // Check for unmatched DB records
+    if (matchedDbRecords.size() < queryResults.size()) {
+        int unmatchedCount = queryResults.size() - matchedDbRecords.size();
+        result.matchDetails.add(unmatchedCount + " DB records did not match any response records (this may be expected)");
+    }
+    
+    // Set success based on whether all response records were matched
+    result.success = result.errors.isEmpty();
+    return result;
+}
+
+/**
+ * Generates automatic field mappings by trying to match DB column names to response field names.
+ * 
+ * @param queryResults the query results from the database
+ * @param responseData the normalized response data
+ * @return map of database column names to response field paths
+ */
+private Map<String, String> generateAutomaticMappings(
+        List<Map<String, Object>> queryResults, 
+        List<Map<String, Object>> responseData) {
+    
+    Map<String, String> mappings = new HashMap<>();
+    
+    if (queryResults.isEmpty() || responseData.isEmpty()) {
+        return mappings;
+    }
+    
+    // Get sample records for mapping
+    Map<String, Object> dbSample = queryResults.get(0);
+    Map<String, Object> responseSample = responseData.get(0);
+    
+    // Map of DB column names in lowercase for case-insensitive matching
+    Map<String, String> dbColumnLowerToActual = new HashMap<>();
+    for (String column : dbSample.keySet()) {
+        dbColumnLowerToActual.put(column.toLowerCase(), column);
+    }
+    
+    // For each response field, try to find a matching DB column
+    for (String responseField : responseSample.keySet()) {
+        // Try direct match first
+        String responseName = getSimpleName(responseField);
+        String responseNameLower = responseName.toLowerCase();
+        
+        // First try exact match
+        if (dbColumnLowerToActual.containsKey(responseNameLower)) {
+            mappings.put(dbColumnLowerToActual.get(responseNameLower), responseField);
+            continue;
+        }
+        
+        // Try common naming patterns
+        String dbStyleName = camelToSnakeCase(responseName);
+        if (dbColumnLowerToActual.containsKey(dbStyleName)) {
+            mappings.put(dbColumnLowerToActual.get(dbStyleName), responseField);
+            continue;
+        }
+        
+        // Try with emp_ prefix (common in employee tables)
+        String withEmpPrefix = "emp_" + dbStyleName;
+        if (dbColumnLowerToActual.containsKey(withEmpPrefix)) {
+            mappings.put(dbColumnLowerToActual.get(withEmpPrefix), responseField);
+            continue;
+        }
+        
+        // Try other common mappings
+        if (responseNameLower.equals("empid") || responseNameLower.equals("employeeid")) {
+            if (dbColumnLowerToActual.containsKey("emp_id")) {
+                mappings.put(dbColumnLowerToActual.get("emp_id"), responseField);
+            }
+        } else if (responseNameLower.equals("deptid") || responseNameLower.equals("departmentid")) {
+            if (dbColumnLowerToActual.containsKey("dept_id")) {
+                mappings.put(dbColumnLowerToActual.get("dept_id"), responseField);
+            }
+        } else if (responseNameLower.equals("empname") || responseNameLower.equals("employeename")) {
+            if (dbColumnLowerToActual.containsKey("emp_name")) {
+                mappings.put(dbColumnLowerToActual.get("emp_name"), responseField);
+            }
+        } else if (responseNameLower.equals("deptname") || responseNameLower.equals("departmentname")) {
+            if (dbColumnLowerToActual.containsKey("dept_name")) {
+                mappings.put(dbColumnLowerToActual.get("dept_name"), responseField);
+            }
+        }
+    }
+    
+    return mappings;
+}
+
+/**
+ * Gets the simple name from a potentially nested path.
+ * Example: "empDetails[0].deptId" becomes "deptId"
+ * 
+ * @param path the potentially nested path
+ * @return the simple field name
+ */
+private String getSimpleName(String path) {
+    int lastDot = path.lastIndexOf('.');
+    return lastDot >= 0 ? path.substring(lastDot + 1) : path;
+}
+
+/**
+ * Converts camelCase to snake_case.
+ * Example: "empName" becomes "emp_name"
+ * 
+ * @param camelCase the camelCase string
+ * @return the snake_case string
+ */
+private String camelToSnakeCase(String camelCase) {
+    // Handle special case of ID at the end
+    camelCase = camelCase.replaceAll("([a-z])ID$", "$1_id");
+    
+    // Regular conversion
+    String regex = "([a-z])([A-Z])";
+    String replacement = "$1_$2";
+    return camelCase.replaceAll(regex, replacement).toLowerCase();
+}
+
+/**
+ * Checks if two values are equal, with special handling for different types.
+ * 
+ * @param value1 first value
+ * @param value2 second value
+ * @return true if the values are considered equal
+ */
+private boolean valuesAreEqual(Object value1, Object value2) {
+    // Handle null values
+    if (value1 == null && value2 == null) {
+        return true;
+    }
+    if (value1 == null || value2 == null) {
+        return false;
+    }
+    
+    // Handle numeric types
+    if (value1 instanceof Number && value2 instanceof Number) {
+        double num1 = ((Number) value1).doubleValue();
+        double num2 = ((Number) value2).doubleValue();
+        
+        // Use a small epsilon for floating point comparison
+        return Math.abs(num1 - num2) < 0.0001;
+    }
+    
+    // Handle string case insensitive comparison
+    if (value1 instanceof String && value2 instanceof String) {
+        return ((String) value1).equalsIgnoreCase((String) value2);
+    }
+    
+    // Handle numeric strings
+    if ((value1 instanceof String && value2 instanceof Number) ||
+        (value1 instanceof Number && value2 instanceof String)) {
+        try {
+            double num1 = value1 instanceof Number ? 
+                           ((Number) value1).doubleValue() : 
+                           Double.parseDouble((String) value1);
+            
+            double num2 = value2 instanceof Number ? 
+                           ((Number) value2).doubleValue() : 
+                           Double.parseDouble((String) value2);
+            
+            return Math.abs(num1 - num2) < 0.0001;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+    
+    // Default string comparison
+    return value1.toString().equalsIgnoreCase(value2.toString());
+}
+
+
+
+Scenario: Verify employee information against database
+  # Setup and data preparation
+  Given I set test data "employeeSalary" to "5000"
+  
+  # Execute SQL query
+  When I execute SQL query "SELECT emp_id, client, client_id, dept_id, dept_name, emp_sal_currency, emp_name, emp_type FROM employee WHERE emp_sal > ?" with parameters "${employeeSalary}" and store result in "empDBData"
+  
+  # API request
+  And I send a request to the employee info API
+  Then the response status code should be 200
+  
+  # Basic validation without mapping
+  And I validate response path "empInfo[*].empDetails" against query results "empDBData" with mapping ""
+  
+  # Validation with explicit mapping
+  And I validate response path "empInfo[*].empDetails" against query results "empDBData" with mapping "emp_id:empId,dept_id:deptId,dept_name:deptName,emp_sal_currency:currency,emp_type:employeeType"
