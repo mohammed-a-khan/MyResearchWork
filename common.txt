@@ -218,6 +218,322 @@ private Object extractFromJsonPath(JSONObject json, String path) {
     return current;
 }
 
+/**
+ * Compares field values between database query results and API response to identify missing or extra values.
+ * Works with any field type (not just IDs) and handles complex nested response structures.
+ * 
+ * @param queryResult the variable name containing database query results
+ * @param responsePath JSON path to the field values in the response (can be nested like "empInfo[*].empDetails[*].deptId")
+ * @param dbField the field name in the database results
+ */
+@QAFTestStep(description = "I verify all {dbField} values from query result {queryResult} exist in response path {responsePath}")
+public void verifyFieldValuesExistInResponse(String dbField, String queryResult, String responsePath) {
+    logger.info("Verifying " + dbField + " values from database exist in response at " + responsePath);
+    
+    ApiResponse response = TestContextManager.getLastApiResponse();
+    if (response == null) {
+        Reporter.log("No API response available. Make sure to send a request first.", MessageTypes.Fail);
+        Assert.fail("No API response available");
+        return;
+    }
+    
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> dbResults = (List<Map<String, Object>>) TestContextManager.getContext("db.query." + queryResult);
+    if (dbResults == null || dbResults.isEmpty()) {
+        Reporter.log("No database results available for key: " + queryResult, MessageTypes.Fail);
+        Assert.fail("No database results available");
+        return;
+    }
+    
+    // Extract values from database results
+    Set<String> dbValues = new HashSet<>();
+    for (Map<String, Object> record : dbResults) {
+        if (record.containsKey(dbField)) {
+            Object valueObj = record.get(dbField);
+            if (valueObj != null) {
+                dbValues.add(valueObj.toString());
+            }
+        }
+    }
+    
+    if (dbValues.isEmpty()) {
+        Reporter.log("No " + dbField + " values found in database results", MessageTypes.Warn);
+        return;
+    }
+    
+    // Extract all values from the response at the specified path
+    Set<String> responseValues = extractAllValuesFromPath(response.getJsonObject(), responsePath);
+    
+    // Find values in database but missing from response
+    Set<String> missingValues = new HashSet<>(dbValues);
+    missingValues.removeAll(responseValues);
+    
+    // Find values in response but not in database
+    Set<String> extraValues = new HashSet<>(responseValues);
+    extraValues.removeAll(dbValues);
+    
+    // Log results
+    Reporter.log("Field comparison summary for '" + dbField + "':");
+    Reporter.log("- Database values: " + dbValues.size());
+    Reporter.log("- Response values: " + responseValues.size());
+    
+    if (missingValues.isEmpty()) {
+        Reporter.log("✓ All database values exist in the response");
+    } else {
+        Reporter.log("✗ " + missingValues.size() + " database values are missing from the response:", 
+                    MessageTypes.Fail);
+        
+        for (String value : missingValues) {
+            Reporter.log("  - Missing: " + value);
+        }
+        
+        Assert.fail("Database values missing from response");
+    }
+    
+    if (!extraValues.isEmpty()) {
+        Reporter.log("! Additional values found in response but not in database: " + extraValues.size());
+        if (extraValues.size() <= 10) {
+            for (String value : extraValues) {
+                Reporter.log("  - Extra: " + value);
+            }
+        } else {
+            Reporter.log("  (Too many additional values to display)");
+        }
+    }
+}
+
+/**
+ * Helper method to extract all values from a JSON path, including handling nested arrays.
+ * 
+ * @param json the JSON object to extract from
+ * @param path the path to extract (supports wildcards and nested arrays)
+ * @return set of all string values found at the path
+ */
+private Set<String> extractAllValuesFromPath(JSONObject json, String path) {
+    Set<String> results = new HashSet<>();
+    
+    // Handle wildcard paths like "empInfo[*].empDetails[*].deptId"
+    if (path.contains("[*]")) {
+        String[] parts = path.split("\\[\\*\\]\\.");
+        
+        // First part before the wildcard
+        String rootPath = parts[0];
+        // Get the array at the root path
+        Object rootObj = extractFromJsonPath(json, rootPath);
+        
+        if (rootObj instanceof JSONArray) {
+            JSONArray rootArray = (JSONArray) rootObj;
+            
+            // For each item in the root array
+            for (int i = 0; i < rootArray.length(); i++) {
+                // If we're at the last part, get the values
+                if (parts.length == 1) {
+                    Object value = rootArray.get(i);
+                    if (value != null) {
+                        results.add(value.toString());
+                    }
+                } 
+                // Otherwise continue with the next part
+                else {
+                    Object item = rootArray.get(i);
+                    if (item instanceof JSONObject) {
+                        // Build the rest of the path
+                        StringBuilder remainingPath = new StringBuilder();
+                        for (int j = 1; j < parts.length; j++) {
+                            remainingPath.append(parts[j]);
+                            if (j < parts.length - 1) {
+                                remainingPath.append("[*].");
+                            }
+                        }
+                        
+                        // Recursively extract values from the remaining path
+                        results.addAll(extractAllValuesFromPath((JSONObject) item, remainingPath.toString()));
+                    }
+                }
+            }
+        }
+    } 
+    // Simple field access
+    else {
+        Object value = extractFromJsonPath(json, path);
+        if (value != null) {
+            if (value instanceof JSONArray) {
+                JSONArray array = (JSONArray) value;
+                for (int i = 0; i < array.length(); i++) {
+                    results.add(array.get(i).toString());
+                }
+            } else {
+                results.add(value.toString());
+            }
+        }
+    }
+    
+    return results;
+}
+
+/**
+ * Verifies that field values from UI data exist in the API response.
+ * 
+ * @param uiDataVariable the variable name containing UI data as List<Map<String, String>>
+ * @param uiFieldName the field name in the UI data map
+ * @param responsePath JSON path to the field values in the response
+ */
+@QAFTestStep(description = "I verify all {uiFieldName} values from UI data {uiDataVariable} exist in response path {responsePath}")
+public void verifyUIValuesExistInResponse(String uiFieldName, String uiDataVariable, String responsePath) {
+    logger.info("Verifying " + uiFieldName + " values from UI data exist in response at " + responsePath);
+    
+    ApiResponse response = TestContextManager.getLastApiResponse();
+    if (response == null) {
+        Reporter.log("No API response available. Make sure to send a request first.", MessageTypes.Fail);
+        Assert.fail("No API response available");
+        return;
+    }
+    
+    @SuppressWarnings("unchecked")
+    List<Map<String, String>> uiData = 
+        (List<Map<String, String>>) TestContextManager.getContext(uiDataVariable);
+    
+    if (uiData == null || uiData.isEmpty()) {
+        Reporter.log("No UI data available for key: " + uiDataVariable, MessageTypes.Fail);
+        Assert.fail("No UI data available");
+        return;
+    }
+    
+    // Extract values from UI data
+    Set<String> uiValues = new HashSet<>();
+    for (Map<String, String> record : uiData) {
+        if (record.containsKey(uiFieldName)) {
+            String value = record.get(uiFieldName);
+            if (value != null && !value.trim().isEmpty()) {
+                uiValues.add(value);
+            }
+        }
+    }
+    
+    if (uiValues.isEmpty()) {
+        Reporter.log("No " + uiFieldName + " values found in UI data", MessageTypes.Warn);
+        return;
+    }
+    
+    // Extract all values from the response at the specified path
+    Set<String> responseValues = extractAllValuesFromPath(response.getJsonObject(), responsePath);
+    
+    // Find values in UI data but missing from response
+    Set<String> missingValues = new HashSet<>(uiValues);
+    missingValues.removeAll(responseValues);
+    
+    // Find values in response but not in UI data
+    Set<String> extraValues = new HashSet<>(responseValues);
+    extraValues.removeAll(uiValues);
+    
+    // Log results
+    Reporter.log("Field comparison summary for '" + uiFieldName + "':");
+    Reporter.log("- UI data values: " + uiValues.size());
+    Reporter.log("- Response values: " + responseValues.size());
+    
+    if (missingValues.isEmpty()) {
+        Reporter.log("✓ All UI data values exist in the response");
+    } else {
+        Reporter.log("✗ " + missingValues.size() + " UI data values are missing from the response:", 
+                    MessageTypes.Fail);
+        
+        for (String value : missingValues) {
+            Reporter.log("  - Missing: " + value);
+        }
+        
+        Assert.fail("UI data values missing from response");
+    }
+    
+    if (!extraValues.isEmpty()) {
+        Reporter.log("! Additional values found in response but not in UI data: " + extraValues.size());
+        if (extraValues.size() <= 10) {
+            for (String value : extraValues) {
+                Reporter.log("  - Extra: " + value);
+            }
+        } else {
+            Reporter.log("  (Too many additional values to display)");
+        }
+    }
+}
+
+/**
+ * Compares full data sets between UI captured data and response data.
+ * Uses the existing validateResponseAgainstQueryResult method for comparison.
+ * 
+ * @param uiDataVariable the variable name containing UI data as List<Map<String, String>>
+ * @param responsePath JSON path to the data in the response
+ * @param keyField optional key field for matching records
+ */
+@QAFTestStep(description = "I compare UI data {uiDataVariable} with response {responsePath} using key {keyField}")
+public void compareUIDataWithResponseData(String uiDataVariable, String responsePath, String keyField) {
+    logger.info("Comparing UI data with response data");
+    
+    // Get the UI data from context
+    @SuppressWarnings("unchecked")
+    List<Map<String, String>> uiData = 
+        (List<Map<String, String>>) TestContextManager.getContext(uiDataVariable);
+    
+    if (uiData == null || uiData.isEmpty()) {
+        Reporter.log("No UI data available for key: " + uiDataVariable, MessageTypes.Fail);
+        Assert.fail("No UI data available");
+        return;
+    }
+    
+    // Store UI data in the expected format for validateResponseAgainstQueryResult
+    // Create a unique key for temporary storage
+    String tempQueryResultKey = "ui.data." + System.currentTimeMillis();
+    TestContextManager.setContext("db.query." + tempQueryResultKey, uiData);
+    
+    // Extract data if we need to handle a complex path
+    ApiResponse response = TestContextManager.getLastApiResponse();
+    if (response == null) {
+        Reporter.log("No API response available. Make sure to send a request first.", MessageTypes.Fail);
+        Assert.fail("No API response available");
+        return;
+    }
+    
+    JSONObject jsonResponse = response.getJsonObject();
+    
+    // Check if we need to handle a nested path
+    if (responsePath.contains(".") || responsePath.contains("[")) {
+        // Extract data from nested path
+        Object responseData = extractFromJsonPath(jsonResponse, responsePath);
+        if (responseData == null) {
+            Reporter.log("Response data not found at path: " + responsePath, MessageTypes.Fail);
+            Assert.fail("Response data not found at path: " + responsePath);
+            return;
+        }
+        
+        // Create a temporary field in the JSON object to hold the extracted data
+        String tempField = "__extracted_data_" + System.currentTimeMillis();
+        
+        // Add it to the response for regular processing
+        if (responseData instanceof JSONArray) {
+            jsonResponse.put(tempField, responseData);
+        } else if (responseData instanceof JSONObject) {
+            JSONArray array = new JSONArray();
+            array.put(responseData);
+            jsonResponse.put(tempField, array);
+        } else {
+            Reporter.log("Data at path '" + responsePath + "' is not a valid JSON object or array", MessageTypes.Fail);
+            Assert.fail("Invalid data type at path: " + responsePath);
+            return;
+        }
+        
+        // Use the temporary field for validation
+        validateResponseAgainstQueryResult(tempField, tempQueryResultKey, keyField);
+        
+        // Clean up
+        jsonResponse.remove(tempField);
+    } else {
+        // Simple field, use directly
+        validateResponseAgainstQueryResult(responsePath, tempQueryResultKey, keyField);
+    }
+    
+    // Clean up
+    TestContextManager.removeContext("db.query." + tempQueryResultKey);
+}
+
 
 Scenario: Verify employee details against database
   # Execute a query and store results
@@ -233,3 +549,31 @@ Scenario: Verify employee details against database
   # Or use the combined step for convenience
   And I validate response field "empInfo[*].empDetails" against SQL query "SELECT * FROM employee WHERE emp_type = ?" with parameters "Permanent" using key fields "empId,deptId"
 
+Scenario: Verify employee details in nested response
+  # Execute SQL query and store results
+  Given I execute SQL query "SELECT emp_id, dept_id FROM employee WHERE emp_sal > ?" with parameters "5000" and store result in "employeeData"
+  
+  # Make API request
+  When I send a GET request to "/api/employees"
+  Then the response status code should be 200
+  
+  # For your specific structure, verify department IDs
+  And I verify all "dept_id" values from query result "employeeData" exist in response path "empInfo[*].empDetails[*].deptId"
+
+// To verify employee IDs match between database and response
+And I verify all "emp_id" values from query result "employeeData" exist in response path "empInfo[*].empId"
+
+
+Scenario: Verify employee data from UI matches API response
+  # Capture data from UI
+  Given I capture employee data from UI and store in "uiEmployeeData"
+  
+  # Make API request
+  When I send a GET request to "/api/employees"
+  Then the response status code should be 200
+  
+  # Simple field value verification
+  And I verify all "empId" values from UI data "uiEmployeeData" exist in response path "empInfo[*].empId"
+  
+  # Full data comparison using existing validateResponseAgainstQueryResult method
+  And I compare UI data "uiEmployeeData" with response "empInfo" using key "empId"
