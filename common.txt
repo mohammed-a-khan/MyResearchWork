@@ -534,6 +534,176 @@ public void compareUIDataWithResponseData(String uiDataVariable, String response
     TestContextManager.removeContext("db.query." + tempQueryResultKey);
 }
 
+/**
+ * Verifies that specific field values from database query results exist in the API response at a given path.
+ * Supports custom mapping between database column names and response field names.
+ * 
+ * @param queryResult the variable name containing database query results
+ * @param responsePath JSON path to the field values in the response (supports nested paths)
+ * @param fieldMappings comma-separated mappings of DB columns to response fields (format: "dbField1:responseField1,dbField2:responseField2")
+ */
+@QAFTestStep(description = "I verify database fields from {queryResult} exist in response path {responsePath} with mappings {fieldMappings}")
+public void verifyDbFieldsExistInResponsePath(String queryResult, String responsePath, String fieldMappings) {
+    logger.info("Verifying database fields from " + queryResult + " exist in response at " + responsePath);
+    
+    ApiResponse response = TestContextManager.getLastApiResponse();
+    if (response == null) {
+        Reporter.log("No API response available. Make sure to send a request first.", MessageTypes.Fail);
+        Assert.fail("No API response available");
+        return;
+    }
+    
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> dbResults = (List<Map<String, Object>>) TestContextManager.getContext("db.query." + queryResult);
+    if (dbResults == null || dbResults.isEmpty()) {
+        Reporter.log("No database results available for key: " + queryResult, MessageTypes.Fail);
+        Assert.fail("No database results available");
+        return;
+    }
+    
+    // Parse field mappings
+    Map<String, String> mappings = new HashMap<>();
+    if (fieldMappings != null && !fieldMappings.isEmpty()) {
+        String[] mappingPairs = fieldMappings.split("\\s*,\\s*");
+        for (String pair : mappingPairs) {
+            String[] parts = pair.split("\\s*:\\s*");
+            if (parts.length == 2) {
+                mappings.put(parts[0].trim(), parts[1].trim());
+            }
+        }
+    }
+    
+    if (mappings.isEmpty()) {
+        Reporter.log("No field mappings provided", MessageTypes.Fail);
+        Assert.fail("No field mappings provided");
+        return;
+    }
+    
+    // For each DB field we want to check, collect all values including nulls
+    Map<String, Set<String>> dbFieldValues = new HashMap<>();
+    for (String dbField : mappings.keySet()) {
+        Set<String> values = new HashSet<>();
+        
+        for (Map<String, Object> record : dbResults) {
+            if (record.containsKey(dbField)) {
+                Object valueObj = record.get(dbField);
+                // Convert to string, preserving nulls as "null"
+                String strValue = (valueObj == null) ? "null" : valueObj.toString();
+                values.add(strValue);
+            }
+        }
+        
+        dbFieldValues.put(dbField, values);
+    }
+    
+    // Extract response data at the specified path
+    JSONObject jsonResponse = response.getJsonObject();
+    Object responseData = extractFromJsonPath(jsonResponse, responsePath);
+    
+    if (responseData == null) {
+        Reporter.log("Response data not found at path: " + responsePath, MessageTypes.Fail);
+        Assert.fail("Response data not found at path: " + responsePath);
+        return;
+    }
+    
+    // Extract all values for each mapped response field
+    Map<String, Set<String>> responseFieldValues = new HashMap<>();
+    for (Map.Entry<String, String> mapping : mappings.entrySet()) {
+        String responseField = mapping.getValue();
+        responseFieldValues.put(responseField, new HashSet<>());
+    }
+    
+    // Process response data and extract values
+    if (responseData instanceof JSONArray) {
+        JSONArray array = (JSONArray) responseData;
+        for (int i = 0; i < array.length(); i++) {
+            if (array.get(i) instanceof JSONObject) {
+                JSONObject obj = array.getJSONObject(i);
+                extractFieldValues(obj, "", responseFieldValues);
+            }
+        }
+    } else if (responseData instanceof JSONObject) {
+        JSONObject obj = (JSONObject) responseData;
+        extractFieldValues(obj, "", responseFieldValues);
+    }
+    
+    // Compare values for each field mapping
+    boolean allMatch = true;
+    for (Map.Entry<String, String> mapping : mappings.entrySet()) {
+        String dbField = mapping.getKey();
+        String responseField = mapping.getValue();
+        
+        Set<String> dbValues = dbFieldValues.get(dbField);
+        Set<String> responseValues = responseFieldValues.get(responseField);
+        
+        // Find values in database but missing from response
+        Set<String> missingValues = new HashSet<>(dbValues);
+        missingValues.removeAll(responseValues);
+        
+        if (missingValues.isEmpty()) {
+            Reporter.log("✓ All values for DB field '" + dbField + "' exist in response field '" + responseField + "'");
+        } else {
+            allMatch = false;
+            Reporter.log("✗ " + missingValues.size() + " values for DB field '" + dbField + 
+                        "' missing from response field '" + responseField + "':", MessageTypes.Fail);
+            
+            for (String value : missingValues) {
+                Reporter.log("  - Missing: " + value);
+            }
+        }
+    }
+    
+    if (!allMatch) {
+        Assert.fail("Some database field values are missing from the response");
+    }
+}
+
+/**
+ * Extracts field values from a JSON object, including handling nested objects.
+ * Supports dot notation in field names and preserves null values.
+ * 
+ * @param json the JSON object
+ * @param prefix the current path prefix (for nested objects)
+ * @param valueMap map of field names to value sets to populate
+ */
+private void extractFieldValues(JSONObject json, String prefix, Map<String, Set<String>> valueMap) {
+    // Process direct fields
+    for (String key : json.keySet()) {
+        String fullPath = prefix.isEmpty() ? key : prefix + "." + key;
+        
+        // Check if this is a field we want
+        if (valueMap.containsKey(fullPath)) {
+            Object value = json.get(key);
+            // Convert to string, preserving nulls as "null"
+            String strValue = (value == JSONObject.NULL || value == null) ? "null" : value.toString();
+            valueMap.get(fullPath).add(strValue);
+        }
+        
+        // Handle nested objects
+        Object value = json.get(key);
+        if (value instanceof JSONObject) {
+            extractFieldValues((JSONObject) value, fullPath, valueMap);
+        } else if (value instanceof JSONArray) {
+            JSONArray array = (JSONArray) value;
+            for (int i = 0; i < array.length(); i++) {
+                if (array.get(i) instanceof JSONObject) {
+                    extractFieldValues(array.getJSONObject(i), fullPath, valueMap);
+                }
+            }
+        }
+    }
+}
+
+Scenario: Verify employee details in response
+  # Execute SQL query
+  Given I execute SQL query "SELECT emp_id, dept_id, dept_name, emp_sal_currency FROM employee WHERE emp_sal > ?" with parameters "5000" and store result in "employeeData"
+  
+  # Make API request
+  When I send a GET request to "/api/employees"
+  Then the response status code should be 200
+  
+  # Compare specific database fields with response fields
+  And I verify database fields from "employeeData" exist in response path "empInfo[*].empDetails" with mappings "emp_id:empId,dept_id:deptId,dept_name:deptName,emp_sal_currency:currency"
 
 Scenario: Verify employee details against database
   # Execute a query and store results
