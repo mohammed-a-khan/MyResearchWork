@@ -68,7 +68,7 @@ public void validateResponseFieldAgainstSqlQuery(String responsePath, String que
         executeSqlQueryWithParametersAndStore(query, parameters, resultVariable);
         
         // Validate the response against the query result
-        validateResponseAgainstQueryResultInternal(responsePath, resultVariable, keyFields);
+        validateResponseAgainstQueryResult(responsePath, resultVariable, keyFields);
         
     } catch (Exception e) {
         logger.error("Error validating response against SQL query: " + e.getMessage(), e);
@@ -78,10 +78,15 @@ public void validateResponseFieldAgainstSqlQuery(String responsePath, String que
 }
 
 /**
- * Enhanced internal implementation of response validation against query result.
- * Supports nested JSON paths and complex data structures.
+ * Enhances the existing validateResponseAgainstQueryResult method with support for nested JSON paths.
+ * This method intercepts calls to validateResponseAgainstQueryResult and adds path extraction.
+ * 
+ * @param responseField the response field to validate (can be a nested path)
+ * @param queryResult the query result variable name
+ * @param keyFields comma-separated key fields for matching records
  */
-private void validateResponseAgainstQueryResultInternal(String responseField, String queryResult, String keyFields) {
+@Override
+public void validateResponseAgainstQueryResult(String responseField, String queryResult, String keyFields) {
     ApiResponse response = TestContextManager.getLastApiResponse();
     if (response == null) {
         Reporter.log("No API response available. Make sure to send a request first.", MessageTypes.Fail);
@@ -89,62 +94,50 @@ private void validateResponseAgainstQueryResultInternal(String responseField, St
         return;
     }
     
-    @SuppressWarnings("unchecked")
-    List<Map<String, Object>> dbResults = (List<Map<String, Object>>) TestContextManager.getContext("db.query." + queryResult);
-    if (dbResults == null || dbResults.isEmpty()) {
-        Reporter.log("No database results available for key: " + queryResult, MessageTypes.Fail);
-        Assert.fail("No database results available");
-        return;
-    }
-    
-    // Convert DB results to string values for comparison
-    List<Map<String, String>> expectedData = convertDbResultsToStringMaps(dbResults);
-    
-    // Extract the response data
     JSONObject jsonResponse = response.getJsonObject();
     
-    // Enhanced to support nested paths with dot notation
-    Object responseData = extractFromJsonPath(jsonResponse, responseField);
-    if (responseData == null) {
-        Reporter.log("Response data not found at path: " + responseField, MessageTypes.Fail);
-        Assert.fail("Response data not found at path: " + responseField);
-        return;
-    }
-    
-    JSONArray responseArray;
-    if (responseData instanceof JSONArray) {
-        responseArray = (JSONArray) responseData;
-    } else if (responseData instanceof JSONObject) {
-        // If it's a single object, wrap in array for consistent processing
-        responseArray = new JSONArray();
-        responseArray.put(responseData);
+    // Check if this is a simple field or a nested path
+    if (responseField.contains(".") || responseField.contains("[")) {
+        // Handle nested path
+        try {
+            // Extract data from nested path
+            Object responseData = extractFromJsonPath(jsonResponse, responseField);
+            if (responseData == null) {
+                Reporter.log("Response data not found at path: " + responseField, MessageTypes.Fail);
+                Assert.fail("Response data not found at path: " + responseField);
+                return;
+            }
+            
+            // Create a temporary field in the JSON object to hold the extracted data
+            String tempField = "__extracted_data_" + System.currentTimeMillis();
+            
+            // Add it to the response for regular processing
+            if (responseData instanceof JSONArray) {
+                jsonResponse.put(tempField, responseData);
+            } else if (responseData instanceof JSONObject) {
+                JSONArray array = new JSONArray();
+                array.put(responseData);
+                jsonResponse.put(tempField, array);
+            } else {
+                Reporter.log("Data at path '" + responseField + "' is not a valid JSON object or array", MessageTypes.Fail);
+                Assert.fail("Invalid data type at path: " + responseField);
+                return;
+            }
+            
+            // Process using the existing method (which will use the stored temp field)
+            super.validateResponseAgainstQueryResult(tempField, queryResult, keyFields);
+            
+            // Clean up
+            jsonResponse.remove(tempField);
+        } catch (Exception e) {
+            logger.error("Error processing nested path: " + e.getMessage(), e);
+            Reporter.log("Error processing nested path: " + e.getMessage(), MessageTypes.Fail);
+            Assert.fail("Error processing nested path: " + e.getMessage());
+        }
     } else {
-        Reporter.log("Response data at path is not an array or object: " + responseField, MessageTypes.Fail);
-        Assert.fail("Invalid response data type at path: " + responseField);
-        return;
+        // Regular field, process normally
+        super.validateResponseAgainstQueryResult(responseField, queryResult, keyFields);
     }
-    
-    // Convert response array to list of maps
-    List<Map<String, String>> actualData = new ArrayList<>();
-    for (int i = 0; i < responseArray.length(); i++) {
-        JSONObject obj = responseArray.getJSONObject(i);
-        Map<String, String> map = new HashMap<>();
-        for (String key : obj.keySet()) {
-            map.put(key, obj.get(key) != null ? obj.get(key).toString() : "null");
-        }
-        actualData.add(map);
-    }
-    
-    // Split key fields if provided
-    String[] keyFieldArray = keyFields != null && !keyFields.isEmpty() ? keyFields.split(",") : null;
-    if (keyFieldArray != null) {
-        for (int i = 0; i < keyFieldArray.length; i++) {
-            keyFieldArray[i] = keyFieldArray[i].trim();
-        }
-    }
-    
-    // Validate the data
-    validateDataSets(expectedData, actualData, keyFieldArray, "Database", "Response");
 }
 
 /**
@@ -224,162 +217,6 @@ private Object extractFromJsonPath(JSONObject json, String path) {
     
     return current;
 }
-
-/**
- * Convenience method for validating response against query result.
- * 
- * @param responseField the response field to validate
- * @param queryResult the query result variable name
- * @param keyFields comma-separated key fields for matching records
- */
-@QAFTestStep(description = "I validate response field {responseField} against query result {queryResult} using key fields {keyFields}")
-public void validateResponseAgainstQueryResult(String responseField, String queryResult, String keyFields) {
-    validateResponseAgainstQueryResultInternal(responseField, queryResult, keyFields);
-}
-
-/**
- * Converts database results from Object values to String values for easier comparison.
- * 
- * @param dbResults the database results with Object values
- * @return list of maps with String values
- */
-private List<Map<String, String>> convertDbResultsToStringMaps(List<Map<String, Object>> dbResults) {
-    List<Map<String, String>> result = new ArrayList<>();
-    
-    for (Map<String, Object> row : dbResults) {
-        Map<String, String> stringMap = new HashMap<>();
-        for (Map.Entry<String, Object> entry : row.entrySet()) {
-            String key = entry.getKey();
-            Object value = entry.getValue();
-            stringMap.put(key, value != null ? value.toString() : "null");
-        }
-        result.add(stringMap);
-    }
-    
-    return result;
-}
-
-/**
- * Validates two data sets against each other.
- * 
- * @param expectedData the expected data set
- * @param actualData the actual data set
- * @param keyFields the key fields for matching records
- * @param expectedLabel label for expected data
- * @param actualLabel label for actual data
- */
-private void validateDataSets(List<Map<String, String>> expectedData, List<Map<String, String>> actualData, 
-                             String[] keyFields, String expectedLabel, String actualLabel) {
-    // Implementation from existing code...
-    // This would be your existing implementation of validateDataSets
-    
-    // Example implementation if needed:
-    if (expectedData.size() != actualData.size()) {
-        Reporter.log("Size mismatch: " + expectedLabel + " has " + expectedData.size() + 
-                    " records, " + actualLabel + " has " + actualData.size() + " records", 
-                    MessageTypes.Warn);
-    }
-    
-    boolean allMatch = true;
-    
-    // If key fields are provided, match by keys
-    if (keyFields != null && keyFields.length > 0) {
-        Map<String, Map<String, String>> expectedByKey = indexByKeys(expectedData, keyFields);
-        Map<String, Map<String, String>> actualByKey = indexByKeys(actualData, keyFields);
-        
-        // Check that all expected keys exist in actual
-        for (String key : expectedByKey.keySet()) {
-            if (!actualByKey.containsKey(key)) {
-                Reporter.log(expectedLabel + " record with key '" + key + "' not found in " + 
-                            actualLabel, MessageTypes.Fail);
-                allMatch = false;
-                continue;
-            }
-            
-            Map<String, String> expectedRecord = expectedByKey.get(key);
-            Map<String, String> actualRecord = actualByKey.get(key);
-            
-            // Compare all fields in the records
-            for (String field : expectedRecord.keySet()) {
-                String expectedValue = expectedRecord.get(field);
-                String actualValue = actualRecord.get(field);
-                
-                if (actualValue == null) {
-                    Reporter.log("Field '" + field + "' missing in " + actualLabel + 
-                                " for record with key '" + key + "'", MessageTypes.Warn);
-                    continue;
-                }
-                
-                if (!actualValue.equals(expectedValue)) {
-                    Reporter.log("Mismatch for field '" + field + "' in record with key '" + 
-                                key + "': " + expectedLabel + "='" + expectedValue + "', " + 
-                                actualLabel + "='" + actualValue + "'", MessageTypes.Fail);
-                    allMatch = false;
-                }
-            }
-        }
-    } 
-    // Otherwise, compare records by position
-    else {
-        int compareCount = Math.min(expectedData.size(), actualData.size());
-        
-        for (int i = 0; i < compareCount; i++) {
-            Map<String, String> expectedRecord = expectedData.get(i);
-            Map<String, String> actualRecord = actualData.get(i);
-            
-            // Compare all fields in the records
-            for (String field : expectedRecord.keySet()) {
-                String expectedValue = expectedRecord.get(field);
-                String actualValue = actualRecord.get(field);
-                
-                if (actualValue == null) {
-                    Reporter.log("Field '" + field + "' missing in " + actualLabel + 
-                                " record #" + (i+1), MessageTypes.Warn);
-                    continue;
-                }
-                
-                if (!actualValue.equals(expectedValue)) {
-                    Reporter.log("Mismatch for field '" + field + "' in record #" + (i+1) + 
-                                ": " + expectedLabel + "='" + expectedValue + "', " + 
-                                actualLabel + "='" + actualValue + "'", MessageTypes.Fail);
-                    allMatch = false;
-                }
-            }
-        }
-    }
-    
-    if (allMatch) {
-        Reporter.log(actualLabel + " data matches " + expectedLabel + " data");
-    } else {
-        Assert.fail(actualLabel + " data does not match " + expectedLabel + " data");
-    }
-}
-
-/**
- * Indexes a list of records by composite key values.
- * 
- * @param records the records to index
- * @param keyFields the key fields to use
- * @return map of composite key to record
- */
-private Map<String, Map<String, String>> indexByKeys(List<Map<String, String>> records, String[] keyFields) {
-    Map<String, Map<String, String>> result = new HashMap<>();
-    
-    for (Map<String, String> record : records) {
-        StringBuilder keyBuilder = new StringBuilder();
-        
-        for (String keyField : keyFields) {
-            String keyValue = record.get(keyField);
-            keyBuilder.append(keyValue != null ? keyValue : "null").append(":");
-        }
-        
-        String compositeKey = keyBuilder.toString();
-        result.put(compositeKey, record);
-    }
-    
-    return result;
-}
-
 
 
 Scenario: Verify employee details against database
