@@ -881,3 +881,241 @@ Scenario: Verify employee details in response
   
   # Compare specific database fields with response fields
   And I verify database fields from "employeeData" exist in response path "empInfo[*].empDetails" with mappings "emp_id:empId,dept_id:deptId,dept_name:deptName,emp_sal_currency:currency" using key "emp_id"
+
+
+/**
+ * Enhanced method to extract data from a JSON object using a path expression.
+ * Properly handles nested array paths like "empInfo[*].empDetails".
+ * 
+ * @param json the JSON object to extract from
+ * @param path the path to extract
+ * @return the extracted data
+ */
+private Object extractFromJsonPath(JSONObject json, String path) {
+    if (path == null || path.isEmpty()) {
+        return json;
+    }
+    
+    // Handle special case for paths with wildcards and multiple segments
+    if (path.contains("[*].")) {
+        String[] parts = path.split("\\[\\*\\]\\.");
+        if (parts.length >= 2) {
+            String arrayPath = parts[0];
+            String nestedField = parts[1];
+            
+            // Get the array at the first path segment
+            Object arrayObj = extractSimplePath(json, arrayPath);
+            if (arrayObj instanceof JSONArray) {
+                JSONArray sourceArray = (JSONArray) arrayObj;
+                JSONArray resultArray = new JSONArray();
+                
+                // For each item in the array, extract the nested field
+                for (int i = 0; i < sourceArray.length(); i++) {
+                    if (sourceArray.get(i) instanceof JSONObject) {
+                        JSONObject item = sourceArray.getJSONObject(i);
+                        
+                        // If the nested field is itself an array, add all its items to our result
+                        if (item.has(nestedField) && item.get(nestedField) instanceof JSONArray) {
+                            JSONArray nestedArray = item.getJSONArray(nestedField);
+                            for (int j = 0; j < nestedArray.length(); j++) {
+                                resultArray.put(nestedArray.get(j));
+                            }
+                        }
+                        // Otherwise if it's a direct field, add it
+                        else if (item.has(nestedField)) {
+                            resultArray.put(item.get(nestedField));
+                        }
+                    }
+                }
+                
+                return resultArray;
+            }
+        }
+    }
+    
+    // Handle standard paths
+    return extractSimplePath(json, path);
+}
+
+/**
+ * Extracts a value from a JSON object using a simple path expression.
+ * 
+ * @param json the JSON object to extract from
+ * @param path the path to extract (no wildcards)
+ * @return the extracted data
+ */
+private Object extractSimplePath(JSONObject json, String path) {
+    String[] segments = path.split("\\.");
+    Object current = json;
+    
+    for (String segment : segments) {
+        if (current == null) {
+            return null;
+        }
+        
+        // Handle array access
+        if (segment.contains("[") && segment.endsWith("]")) {
+            String fieldName = segment.substring(0, segment.indexOf('['));
+            String indexStr = segment.substring(segment.indexOf('[') + 1, segment.length() - 1);
+            
+            // Get the array field first
+            if (current instanceof JSONObject) {
+                JSONObject jsonObj = (JSONObject) current;
+                if (!jsonObj.has(fieldName)) {
+                    return null;
+                }
+                current = jsonObj.get(fieldName);
+            } else {
+                return null;
+            }
+            
+            // Then handle array indexing
+            if (current instanceof JSONArray) {
+                JSONArray array = (JSONArray) current;
+                
+                // Handle numeric index
+                try {
+                    int index = Integer.parseInt(indexStr);
+                    if (index >= 0 && index < array.length()) {
+                        current = array.get(index);
+                    } else {
+                        return null;
+                    }
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        } 
+        // Simple field access
+        else if (current instanceof JSONObject) {
+            JSONObject jsonObj = (JSONObject) current;
+            if (!jsonObj.has(segment)) {
+                return null;
+            }
+            current = jsonObj.get(segment);
+        } else {
+            return null;
+        }
+    }
+    
+    return current;
+}
+
+
+/**
+ * Verifies that database query results exist in the API response at a specific path.
+ * Supports custom field mapping and nested response paths.
+ * 
+ * @param queryResult the variable name containing database query results
+ * @param responsePath JSON path to the field values in the response (supports nested paths)
+ * @param fieldMappings comma-separated mappings of DB columns to response fields (format: "dbField1:responseField1,dbField2:responseField2")
+ * @param keyField optional key field for matching records
+ */
+@QAFTestStep(description = "I verify database fields from {queryResult} exist in response path {responsePath} with mappings {fieldMappings} using key {keyField}")
+public void verifyDbFieldsInResponsePath(String queryResult, String responsePath, String fieldMappings, String keyField) {
+    logger.info("Verifying database fields from " + queryResult + " exist in response at " + responsePath);
+    
+    ApiResponse response = TestContextManager.getLastApiResponse();
+    if (response == null) {
+        Reporter.log("No API response available. Make sure to send a request first.", MessageTypes.Fail);
+        Assert.fail("No API response available");
+        return;
+    }
+    
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> dbResults = (List<Map<String, Object>>) TestContextManager.getContext("db.query." + queryResult);
+    if (dbResults == null || dbResults.isEmpty()) {
+        Reporter.log("No database results available for key: " + queryResult, MessageTypes.Fail);
+        Assert.fail("No database results available");
+        return;
+    }
+    
+    // Create a copy of the DB results with only the fields we want to compare
+    List<Map<String, Object>> filteredDbResults = new ArrayList<>();
+    
+    // Parse field mappings to get the DB fields to include
+    Set<String> dbFieldsToInclude = new HashSet<>();
+    Map<String, String> dbToResponseMapping = new HashMap<>();
+    
+    if (fieldMappings != null && !fieldMappings.isEmpty()) {
+        String[] mappingPairs = fieldMappings.split("\\s*,\\s*");
+        for (String pair : mappingPairs) {
+            String[] parts = pair.split("\\s*:\\s*");
+            if (parts.length == 2) {
+                String dbField = parts[0].trim();
+                String responseField = parts[1].trim();
+                dbFieldsToInclude.add(dbField);
+                dbToResponseMapping.put(dbField, responseField);
+            }
+        }
+    }
+    
+    if (dbFieldsToInclude.isEmpty()) {
+        Reporter.log("No field mappings provided", MessageTypes.Fail);
+        Assert.fail("No field mappings provided");
+        return;
+    }
+    
+    // Create filtered DB results with only the specified fields
+    for (Map<String, Object> record : dbResults) {
+        Map<String, Object> filteredRecord = new HashMap<>();
+        
+        // Always include the key field if specified
+        if (keyField != null && !keyField.isEmpty() && record.containsKey(keyField)) {
+            filteredRecord.put(keyField, record.get(keyField));
+        }
+        
+        // Add the fields we want to compare
+        for (String dbField : dbFieldsToInclude) {
+            if (record.containsKey(dbField)) {
+                // Get the mapped response field name
+                String responseField = dbToResponseMapping.get(dbField);
+                // Store the value with the response field name as the key for proper comparison
+                filteredRecord.put(responseField, record.get(dbField));
+            }
+        }
+        
+        filteredDbResults.add(filteredRecord);
+    }
+    
+    // Store these filtered results in the context with a temporary key
+    String tempKey = "temp.db." + System.currentTimeMillis();
+    TestContextManager.setContext("db.query." + tempKey, filteredDbResults);
+    
+    // Extract response data at the specified path
+    JSONObject jsonResponse = response.getJsonObject();
+    Object responseData = extractFromJsonPath(jsonResponse, responsePath);
+    
+    if (responseData == null) {
+        Reporter.log("Response data not found at path: " + responsePath, MessageTypes.Fail);
+        Assert.fail("Response data not found at path: " + responsePath);
+        return;
+    }
+    
+    // Create a temporary field in the JSON object to hold the extracted data
+    String tempField = "__extracted_data_" + System.currentTimeMillis();
+    
+    // Add it to the response for regular processing
+    if (responseData instanceof JSONArray) {
+        jsonResponse.put(tempField, responseData);
+    } else if (responseData instanceof JSONObject) {
+        JSONArray array = new JSONArray();
+        array.put(responseData);
+        jsonResponse.put(tempField, array);
+    } else {
+        Reporter.log("Data at path '" + responsePath + "' is not a valid JSON object or array", MessageTypes.Fail);
+        Assert.fail("Invalid data type at path: " + responsePath);
+        return;
+    }
+    
+    try {
+        // Use the existing validation method with our temporary data
+        validateResponseAgainstQueryResult(tempField, tempKey, keyField);
+    } finally {
+        // Clean up temporary data
+        jsonResponse.remove(tempField);
+        TestContextManager.removeContext("db.query." + tempKey);
+    }
+}
