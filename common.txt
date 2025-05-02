@@ -747,3 +747,137 @@ Scenario: Verify employee data from UI matches API response
   
   # Full data comparison using existing validateResponseAgainstQueryResult method
   And I compare UI data "uiEmployeeData" with response "empInfo" using key "empId"
+
+/**
+ * Verifies that database query results exist in the API response at a specific path.
+ * Supports custom field mapping and nested response paths.
+ * 
+ * @param queryResult the variable name containing database query results
+ * @param responsePath JSON path to the field values in the response (supports nested paths)
+ * @param fieldMappings comma-separated mappings of DB columns to response fields (format: "dbField1:responseField1,dbField2:responseField2")
+ * @param keyField optional key field for matching records
+ */
+@QAFTestStep(description = "I verify database fields from {queryResult} exist in response path {responsePath} with mappings {fieldMappings} using key {keyField}")
+public void verifyDbFieldsInResponsePath(String queryResult, String responsePath, String fieldMappings, String keyField) {
+    logger.info("Verifying database fields from " + queryResult + " exist in response at " + responsePath);
+    
+    ApiResponse response = TestContextManager.getLastApiResponse();
+    if (response == null) {
+        Reporter.log("No API response available. Make sure to send a request first.", MessageTypes.Fail);
+        Assert.fail("No API response available");
+        return;
+    }
+    
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> dbResults = (List<Map<String, Object>>) TestContextManager.getContext("db.query." + queryResult);
+    if (dbResults == null || dbResults.isEmpty()) {
+        Reporter.log("No database results available for key: " + queryResult, MessageTypes.Fail);
+        Assert.fail("No database results available");
+        return;
+    }
+    
+    // Create a copy of the DB results with only the fields we want to compare
+    List<Map<String, Object>> filteredDbResults = new ArrayList<>();
+    
+    // Parse field mappings to get the DB fields to include
+    Set<String> dbFieldsToInclude = new HashSet<>();
+    Map<String, String> dbToResponseMapping = new HashMap<>();
+    
+    if (fieldMappings != null && !fieldMappings.isEmpty()) {
+        String[] mappingPairs = fieldMappings.split("\\s*,\\s*");
+        for (String pair : mappingPairs) {
+            String[] parts = pair.split("\\s*:\\s*");
+            if (parts.length == 2) {
+                String dbField = parts[0].trim();
+                String responseField = parts[1].trim();
+                dbFieldsToInclude.add(dbField);
+                dbToResponseMapping.put(dbField, responseField);
+            }
+        }
+    }
+    
+    if (dbFieldsToInclude.isEmpty()) {
+        Reporter.log("No field mappings provided", MessageTypes.Fail);
+        Assert.fail("No field mappings provided");
+        return;
+    }
+    
+    // Create filtered DB results with only the specified fields
+    for (Map<String, Object> record : dbResults) {
+        Map<String, Object> filteredRecord = new HashMap<>();
+        
+        // Always include the key field if specified
+        if (keyField != null && !keyField.isEmpty() && record.containsKey(keyField)) {
+            filteredRecord.put(keyField, record.get(keyField));
+        }
+        
+        // Add the fields we want to compare
+        for (String dbField : dbFieldsToInclude) {
+            if (record.containsKey(dbField)) {
+                // Get the mapped response field name
+                String responseField = dbToResponseMapping.get(dbField);
+                // Store the value with the response field name as the key for proper comparison
+                filteredRecord.put(responseField, record.get(dbField));
+            }
+        }
+        
+        filteredDbResults.add(filteredRecord);
+    }
+    
+    // Store these filtered results in the context with a temporary key
+    String tempKey = "temp.db." + System.currentTimeMillis();
+    TestContextManager.setContext("db.query." + tempKey, filteredDbResults);
+    
+    // Extract response data at the specified path
+    JSONObject jsonResponse = response.getJsonObject();
+    
+    // Check if we need to handle a nested path
+    if (responsePath.contains(".") || responsePath.contains("[")) {
+        // Extract data from nested path
+        Object responseData = extractFromJsonPath(jsonResponse, responsePath);
+        if (responseData == null) {
+            Reporter.log("Response data not found at path: " + responsePath, MessageTypes.Fail);
+            Assert.fail("Response data not found at path: " + responsePath);
+            return;
+        }
+        
+        // Create a temporary field in the JSON object to hold the extracted data
+        String tempField = "__extracted_data_" + System.currentTimeMillis();
+        
+        // Add it to the response for regular processing
+        if (responseData instanceof JSONArray) {
+            jsonResponse.put(tempField, responseData);
+        } else if (responseData instanceof JSONObject) {
+            JSONArray array = new JSONArray();
+            array.put(responseData);
+            jsonResponse.put(tempField, array);
+        } else {
+            Reporter.log("Data at path '" + responsePath + "' is not a valid JSON object or array", MessageTypes.Fail);
+            Assert.fail("Invalid data type at path: " + responsePath);
+            return;
+        }
+        
+        // Use the existing validation method with our temporary data
+        validateResponseAgainstQueryResult(tempField, tempKey, keyField);
+        
+        // Clean up
+        jsonResponse.remove(tempField);
+    } else {
+        // Simple field - use directly
+        validateResponseAgainstQueryResult(responsePath, tempKey, keyField);
+    }
+    
+    // Clean up temporary data
+    TestContextManager.removeContext("db.query." + tempKey);
+}
+
+Scenario: Verify employee details in response
+  # Execute SQL query
+  Given I execute SQL query "SELECT emp_id, dept_id, dept_name, emp_sal_currency FROM employee WHERE emp_sal > ?" with parameters "5000" and store result in "employeeData"
+  
+  # Make API request
+  When I send a GET request to "/api/employees"
+  Then the response status code should be 200
+  
+  # Compare specific database fields with response fields
+  And I verify database fields from "employeeData" exist in response path "empInfo[*].empDetails" with mappings "emp_id:empId,dept_id:deptId,dept_name:deptName,emp_sal_currency:currency" using key "emp_id"
